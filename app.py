@@ -1,26 +1,40 @@
-
 """
-PaperLens: a Streamlit research-paper assistant.
+PaperLens: AI-Powered Research Paper Assistant
+Version 2.0 (High-Performance Single Drop-In File)
 
-Features:
-- Understand Paper: guided, first-read report.
-- Paper Summary: concise revision notes.
-- Ask the Paper: answers grounded in relevant paper passages.
-- Word Explorer: explain a term in the paper's context.
-- Deep Dive: investigate a section, method, or experiment.
+An interactive Streamlit application designed to help students, academics,
+and researchers deeply read, understand, summarize, and question academic papers.
 
-Setup:
-1. Install the required Python packages.
-2. Put GROQ_API_KEY=your_key_here in a .env file beside app.py.
-3. Run: streamlit run app.py
+Core Features:
+1. Understand Paper: Two-pass guided reading report breaking down motivation,
+   prerequisites, methodology, and conclusions.
+2. Paper Summary: Revision-friendly structured synthesis matching the paper's
+   original section headings.
+3. Ask the Paper: Grounded question-answering powered by BM25 retrieval with
+   page-level citations.
+4. Word Explorer: Technical terminology breakdown with definitions, analogies,
+   and in-paper usage context.
+5. Deep Dive: Granular technical analysis of specific equations, experiments,
+   or subsections.
+
+How to Run:
+1. Ensure your .env file in this directory contains:
+   GROQ_API_KEY=gsk_your_actual_key_here
+2. Install dependencies:
+   pip install -r requirements.txt
+3. Start the application:
+   streamlit run app.py
 """
 
-# -----------------------------
-# Imports
-# -----------------------------
+# ==============================================================================
+# SECTION 1: Standard & Third-Party Imports
+# ==============================================================================
 import os
+import re
+import math
+import time
 from io import BytesIO
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Generator, Any, Optional
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -28,1104 +42,850 @@ from groq import Groq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 
-
-# -----------------------------
-# Page configuration and setup
-# -----------------------------
-st.set_page_config(
-    page_title="PaperLens",
-    page_icon="📄",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# Load environment variables from the .env file.
+# Load local environment variables from .env file (silently in background)
 load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-if not GROQ_API_KEY:
-    st.error("Groq API key not found. Add GROQ_API_KEY=... to your .env file.")
-    st.stop()
-
-# Create the Groq client.
-client = Groq(api_key=GROQ_API_KEY)
-
-# Model used by all AI features.
-MODEL_NAME = "openai/gpt-oss-20b"
 
 
-# -----------------------------
-# Shared AI helper
-# -----------------------------
-def ask_groq(
-    system_prompt: str,
-    user_prompt: str,
-    max_tokens: int = 1800
-) -> str:
-    """Send one request to Groq and return the generated text."""
-
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.2,
-        max_tokens=max_tokens,
-    )
-
-    answer = response.choices[0].message.content
-
-    if not answer:
-        raise ValueError(
-            "The model returned an empty response. Please try again."
-        )
-
-    return answer.strip()
-
-
-# -----------------------------
-# Find relevant paper excerpts
-# -----------------------------
-def get_relevant_chunks(
-    paper: Dict,
-    query: str,
-    limit: int = 4
-) -> List[str]:
+# ==============================================================================
+# SECTION 2: BM25 Information Retrieval Engine (Pure Python, Zero Dependency)
+# ==============================================================================
+class BM25Retriever:
     """
-    Select text chunks with the most query-term overlap.
-
-    This is a lightweight keyword search. It does not use embeddings,
-    so it can miss passages that use different wording.
+    A lightweight, mathematically sound BM25Okapi search engine.
+    
+    Why BM25 over simple keyword counting?
+    - Simple keyword search counts words like 'a', 'the', or matches substrings
+      (e.g., 'cat' inside 'communication').
+    - BM25 accounts for:
+      1. Term Frequency (TF): How often a query word appears in a chunk.
+      2. Inverse Document Frequency (IDF): Rare technical terms (e.g. 'backpropagation')
+         get much higher weight than common academic words (e.g. 'paper', 'method').
+      3. Document Length Normalization: Prevents longer chunks from artificially winning.
+      4. Exact Phrase Boost: Rewards chunks where the query appears verbatim.
     """
+    def __init__(self, chunks: List[Dict[str, Any]], k1: float = 1.5, b: float = 0.75):
+        """
+        Initialize index with paper chunks.
+        k1 (default 1.5): Controls term frequency saturation.
+        b (default 0.75): Controls document length normalization penalty.
+        """
+        self.chunks = chunks
+        self.k1 = k1
+        self.b = b
+        self.corpus_size = len(chunks)
+        self.avg_dl = 0.0
+        self.doc_lens: List[int] = []
+        self.doc_freqs: Dict[str, int] = {}
+        self.chunk_tokens: List[List[str]] = []
 
-    chunks = paper.get("chunks", [])
+        # Common stop-words to ignore during scoring
+        self.stopwords = {
+            "the", "and", "for", "that", "this", "with", "from", "what",
+            "when", "where", "which", "does", "into", "about", "are", "was",
+            "were", "how", "why", "can", "could", "would", "should", "paper",
+            "explain", "please", "tell", "describe", "give", "its", "their",
+            "have", "has", "had", "not", "but", "you", "your", "use", "used",
+            "then", "been", "than", "also", "each", "more", "most", "some",
+            "such", "only", "other", "them", "these", "they", "will",
+        }
 
-    if not chunks:
-        return []
+        self._build_index()
 
-    stop_words = {
-        "the", "and", "for", "that", "this", "with", "from", "what",
-        "when", "where", "which", "does", "into", "about", "are", "was",
-        "were", "how", "why", "can", "could", "would", "should", "paper",
-        "explain", "please", "tell", "describe", "give", "its", "their",
-        "have", "has", "had", "not", "but", "you", "your", "use", "used",
-    }
+    def tokenize(self, text: str) -> List[str]:
+        """Convert text into lowercase individual words, stripping punctuation."""
+        clean = text.lower()
+        # Find alpha-numeric words of at least 2 characters
+        words = re.findall(r"\b[a-zA-Z0-9_\-\.]{2,}\b", clean)
+        return [w for w in words if w not in self.stopwords]
 
-    cleaned_query = query.lower()
+    def _build_index(self):
+        """Pre-compute document lengths, inverted frequencies, and average length."""
+        total_len = 0
+        for chunk in self.chunks:
+            tokens = self.tokenize(chunk["text"])
+            self.chunk_tokens.append(tokens)
+            doc_len = len(tokens)
+            self.doc_lens.append(doc_len)
+            total_len += doc_len
 
-    for char in ".,?!:;()[]{}\"'`/\\":
-        cleaned_query = cleaned_query.replace(char, " ")
+            # Track how many distinct chunks contain each term
+            unique_tokens = set(tokens)
+            for token in unique_tokens:
+                self.doc_freqs[token] = self.doc_freqs.get(token, 0) + 1
 
-    terms = {
-        word
-        for word in cleaned_query.split()
-        if len(word) >= 3 and word not in stop_words
-    }
+        self.avg_dl = (total_len / self.corpus_size) if self.corpus_size > 0 else 1.0
 
-    # If the query has no useful terms, use the first chunks.
-    if not terms:
-        return chunks[:limit]
+    def get_idf(self, term: str) -> float:
+        """Compute Robertson-Spärck Jones Inverse Document Frequency (IDF)."""
+        df = self.doc_freqs.get(term, 0)
+        # Smoothed BM25 IDF formula
+        return math.log(1.0 + (self.corpus_size - df + 0.5) / (df + 0.5))
 
-    scored: List[Tuple[int, int, str]] = []
+    def retrieve(self, query: str, top_k: int = 4) -> List[Tuple[Dict[str, Any], float]]:
+        """
+        Rank all chunks against the query and return the top_k best matches.
+        Returns a list of tuples: (chunk_dict, bm25_score).
+        """
+        if not self.chunks:
+            return []
 
-    for index, chunk in enumerate(chunks):
-        lower_chunk = chunk.lower()
-        score = sum(lower_chunk.count(term) for term in terms)
+        query_tokens = self.tokenize(query)
+        # Fallback: if query is empty or only stopwords, return top chunks
+        if not query_tokens:
+            return [(chunk, 0.0) for chunk in self.chunks[:top_k]]
 
-        if score:
-            scored.append((score, -index, chunk))
+        clean_phrase = " ".join(query_tokens)
+        scores: List[Tuple[float, int, Dict[str, Any]]] = []
 
-    # Sort by score, keeping earlier chunks ahead when scores tie.
-    scored.sort(reverse=True)
+        for idx, chunk in enumerate(self.chunks):
+            tokens = self.chunk_tokens[idx]
+            doc_len = self.doc_lens[idx]
+            if doc_len == 0:
+                continue
 
-    selected = [item[2] for item in scored[:limit]]
+            # Calculate Term Frequency (TF) for this chunk
+            tf_map: Dict[str, int] = {}
+            for t in tokens:
+                tf_map[t] = tf_map.get(t, 0) + 1
 
-    # Fall back to the first chunks if no terms match.
-    if selected:
-        return selected
+            # Compute BM25 formula
+            score = 0.0
+            for term in query_tokens:
+                if term in tf_map:
+                    tf = tf_map[term]
+                    idf = self.get_idf(term)
+                    numerator = tf * (self.k1 + 1.0)
+                    denominator = tf + self.k1 * (1.0 - self.b + self.b * (doc_len / self.avg_dl))
+                    score += idf * (numerator / denominator)
 
-    return chunks[:min(2, len(chunks))]
+            # Exact phrase boost (reward verbatim matches by 30%)
+            chunk_text_lower = chunk["text"].lower()
+            if clean_phrase in chunk_text_lower:
+                score *= 1.30
+
+            if score > 0:
+                scores.append((score, -idx, chunk))
+
+        # Sort descending by score
+        scores.sort(reverse=True)
+
+        if scores:
+            return [(item[2], item[0]) for item in scores[:top_k]]
+
+        # Fallback if no keywords matched: return the introductory chunks
+        return [(chunk, 0.0) for chunk in self.chunks[:min(2, len(self.chunks))]]
 
 
-# -----------------------------
-# PDF processing
-# -----------------------------
-def process_pdf(uploaded_file) -> Dict:
-    """Extract text, metadata, and searchable chunks from a PDF."""
-
+# ==============================================================================
+# SECTION 3: Document Processing & PDF Text Ingestion
+# ==============================================================================
+def process_pdf(uploaded_file) -> Dict[str, Any]:
+    """
+    Parse uploaded PDF bytes into structured chunks.
+    Key tasks:
+    1. Extract page text using pypdf.
+    2. De-hyphenate broken words across line breaks (e.g. 'trans-\nformer' -> 'transformer').
+    3. Retain page number metadata on every excerpt so answers can cite exact pages.
+    4. Split into manageable text chunks using RecursiveCharacterTextSplitter.
+    """
     reader = PdfReader(BytesIO(uploaded_file.getvalue()))
-
     if reader.is_encrypted:
-        raise ValueError(
-            "This PDF is encrypted. Upload an unencrypted PDF."
-        )
+        raise ValueError("This PDF is encrypted. Please provide an unencrypted PDF.")
 
-    # Extract text from each page.
-    extracted_pages = [
-        (page.extract_text() or "").strip()
-        for page in reader.pages
-    ]
+    page_data: List[Dict[str, Any]] = []
+    full_text_parts: List[str] = []
 
-    # Join non-empty pages into one document.
-    full_text = "\n\n".join(
-        text for text in extracted_pages if text
-    ).strip()
+    for page_idx, page in enumerate(reader.pages, start=1):
+        raw_text = (page.extract_text() or "").strip()
+        if raw_text:
+            # Repair hyphenated word wraps common in academic double-column PDFs
+            normalized_text = re.sub(r"(\b\w+)-\n(\w+\b)", r"\1\2", raw_text)
+            page_data.append({"page": page_idx, "text": normalized_text})
+            full_text_parts.append(f"[Page {page_idx}]\n{normalized_text}")
 
-    chunks: List[str] = []
+    full_text = "\n\n".join(full_text_parts).strip()
+    chunks: List[Dict[str, Any]] = []
 
-    # Split extracted text into manageable chunks.
-    if full_text:
+    if full_text_parts:
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=4000,
-            chunk_overlap=400,
+            chunk_size=3500,
+            chunk_overlap=350,
             separators=["\n\n", "\n", ". ", " ", ""],
         )
 
-        chunks = splitter.split_text(full_text)
+        chunk_counter = 1
+        for p in page_data:
+            page_chunks = splitter.split_text(p["text"])
+            for text_chunk in page_chunks:
+                if len(text_chunk.strip()) > 40:
+                    chunks.append({
+                        "id": chunk_counter,
+                        "page": p["page"],
+                        "text": text_chunk.strip()
+                    })
+                    chunk_counter += 1
 
-    # Use the PDF metadata title when available.
+    # Extract or infer paper title from metadata
     metadata = reader.metadata
-    title = metadata.title.strip() if metadata and metadata.title else ""
-
-    if not title:
+    title = metadata.title.strip() if (metadata and metadata.title) else ""
+    if not title or len(title) < 4:
         title = uploaded_file.name
 
     return {
         "name": uploaded_file.name,
         "title": title,
         "pages": len(reader.pages),
+        "pages_with_text": len(page_data),
         "text": full_text,
         "chunks": chunks,
-        "pages_with_text": sum(
-            bool(text) for text in extracted_pages
-        ),
         "processed": True,
     }
 
 
-# -----------------------------
-# Understand Paper: report generation
-# -----------------------------
-def generate_understanding_report(paper_text: str) -> str:
-    """Generate a detailed first-read report using a two-pass process."""
+# ==============================================================================
+# SECTION 4: AI Client, Retry Logic & Streaming Generation
+# ==============================================================================
+def get_groq_client(api_key: str) -> Optional[Groq]:
+    """Create Groq client instance."""
+    if not api_key:
+        return None
+    return Groq(api_key=api_key)
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=7000,
-        chunk_overlap=500,
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
-
-    chunks = splitter.split_text(paper_text)
-
-    if not chunks:
-        raise ValueError("No readable text was found in the paper.")
-
-    section_notes = []
-
-    # First pass: analyse each part of the paper.
-    for index, chunk in enumerate(chunks, start=1):
-        notes = ask_groq(
-            (
-                "You are PaperLens, a precise research-paper tutor. "
-                "Never invent facts absent from the supplied text."
-            ),
-            f"""Analyze this part of a research paper.
-
-Identify, when present:
-- Section headings
-- Main concepts and arguments
-- Methodology and experiment steps
-- Findings and limitations
-- Technical terms that need explanation
-
-Preserve technical details. Do not assume a finding or experiment
-exists if it is not mentioned.
-
-PAPER SEGMENT {index} OF {len(chunks)}:
-{chunk}""",
-            max_tokens=1800,
-        )
-
-        section_notes.append(notes)
-
-    notes_text = "\n\n".join(section_notes)
-
-    # Second pass: combine notes into a guided reading report.
-    return ask_groq(
-        (
-            "You are PaperLens, an expert research-paper tutor. "
-            "Produce an accurate, structured teaching report."
-        ),
-        f"""Create a guided reading report from the research notes below.
-
-Use these sections where supported by the paper:
-1. Prerequisites
-2. Research Problem and Motivation
-3. Section-by-Section Explanation
-4. Methodology and Experiments
-5. Key Findings and Results
-6. Limitations
-7. Technical Details
-
-Requirements:
-- Follow the paper's actual headings and order wherever identifiable.
-- Explain concepts simply without losing technical accuracy.
-- Explain experiment steps only when supported by the notes.
-- Put advanced technical details near the end.
-- Do not invent findings, headings, or experimental steps.
-- If information is unavailable, say so.
-- Do not mention page numbers.
-- Avoid tables unless needed to explain an experiment.
-
-RESEARCH NOTES:
-{notes_text}""",
-        max_tokens=6000,
-    )
-
-
-# -----------------------------
-# Paper Summary: revision notes
-# -----------------------------
-def generate_paper_summary(paper_text: str) -> str:
-    """Generate a concise, structured summary for later revision."""
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=6000,
-        chunk_overlap=400,
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
-
-    chunks = splitter.split_text(paper_text)
-
-    if not chunks:
-        raise ValueError("No readable text was found in the paper.")
-
-    chunk_notes = []
-
-    # First pass: summarise each part.
-    for index, chunk in enumerate(chunks, start=1):
-        notes = ask_groq(
-            (
-                "You create accurate, concise research-paper revision "
-                "notes. Never invent information."
-            ),
-            f"""Summarize this part of a research paper for revision.
-
-Preserve identifiable section headings. Capture the main argument,
-method, important technical details, findings, and limitations when
-present. Keep the notes concise but meaningful. Do not add facts
-unsupported by the text.
-
-PART {index} OF {len(chunks)}:
-{chunk}""",
-            max_tokens=1400,
-        )
-
-        chunk_notes.append(notes)
-
-    notes_text = "\n\n".join(chunk_notes)
-
-    # Second pass: create the final revision-friendly summary.
-    return ask_groq(
-        "You are PaperLens, an accurate academic summarization assistant.",
-        f"""Create a revision-friendly summary from these research notes.
-
-Requirements:
-- Follow the paper's original headings and order wherever identifiable.
-- Do not force unrelated content into invented sections.
-- Explain the main idea of each section concisely.
-- Include methodology, key results, and limitations when present.
-- Retain essential technical details and terminology.
-- Do not mention page numbers.
-- Do not invent findings or claims.
-- Prefer headings and bullet points over tables.
-
-RESEARCH NOTES:
-{notes_text}""",
-        max_tokens=5000,
-    )
-
-# -----------------------------
-# Session state
-# -----------------------------
-# Store uploaded paper data and generated answers across Streamlit reruns.
-if "paper_data" not in st.session_state:
-    st.session_state.paper_data = None
-
-if "active_feature" not in st.session_state:
-    st.session_state.active_feature = "Understand Paper"
-
-# Each feature stores its own result.
-for state_key in (
-    "understanding_report",
-    "paper_summary",
-    "paper_answers",
-    "word_explanation",
-    "deep_dive_result",
-):
-    if state_key not in st.session_state:
-        st.session_state[state_key] = None
-
-
-# -----------------------------
-# Custom styling
-# -----------------------------
-st.markdown(
+def ask_groq_text(
+    client: Groq,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.2,
+    max_tokens: int = 2048,
+    max_retries: int = 3,
+) -> str:
     """
-    <style>
-    .block-container {
-        padding-top: 2rem;
-        padding-bottom: 3rem;
-        max-width: 1200px;
-    }
+    Synchronous API call with automatic exponential backoff retry.
+    Used for intermediate map-pass steps when synthesizing multiple sections.
+    """
+    delay = 2.0
+    last_err = None
 
-    [data-testid="stSidebar"] {
-        border-right: 1px solid rgba(128, 128, 128, 0.2);
-    }
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            content = response.choices[0].message.content
+            if not content:
+                raise ValueError("Model returned an empty response.")
+            return content.strip()
 
-    .hero {
-        padding: 2rem;
-        border-radius: 18px;
-        background: linear-gradient(
-            135deg,
-            rgba(91, 100, 240, 0.16),
-            rgba(36, 180, 170, 0.10)
-        );
-        border: 1px solid rgba(128, 128, 128, 0.2);
-        margin-bottom: 1.5rem;
-    }
+        except Exception as e:
+            last_err = e
+            # Sleep with exponential backoff on rate limits or network issues
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+                delay *= 2.0
+            else:
+                raise last_err
 
-    .hero-label {
-        font-size: 0.8rem;
-        letter-spacing: 0.12em;
-        text-transform: uppercase;
-        opacity: 0.75;
-    }
+    raise last_err or RuntimeError("Failed after retries.")
 
-    .feature-card {
-        padding: 1.2rem;
-        border: 1px solid rgba(128, 128, 128, 0.25);
-        border-radius: 14px;
-        min-height: 145px;
-        margin-bottom: 0.8rem;
-    }
+def ask_groq_stream(
+    client: Groq,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.2,
+    max_tokens: int = 3000,
+) -> Generator[str, None, None]:
+    """
+    Streaming API call that yields tokens chunk-by-chunk in real time.
+    Provides immediate visual response for Streamlit's st.write_stream().
+    """
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=temperature,
+        max_tokens=max_tokens,
+        stream=True,
+    )
+    for chunk in response:
+        content = chunk.choices[0].delta.content
+        if content:
+            yield content
 
-    .muted {
-        opacity: 0.7;
-        font-size: 0.9rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+def display_retrieval_citations(results: List[Tuple[Dict[str, Any], float]]):
+    """
+    Render an interactive collapsible drawer displaying the exact
+    paper chunks, page numbers, and relevance scores grounding the answer.
+    """
+    with st.expander(f"📚 Retrieved Evidence & Citations ({len(results)} chunks)", expanded=False):
+        for chunk, score in results:
+            st.markdown(
+                f"""
+                <div class="citation-box">
+                    <div class="citation-meta">📄 Page {chunk['page']} · Chunk #{chunk['id']} · Relevance Score: {score:.2f}</div>
+                    <div>{chunk['text']}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
 
-# -----------------------------
-# Sidebar
-# -----------------------------
-with st.sidebar:
-    st.markdown("# 📄 PaperLens")
-    st.caption("YOUR RESEARCH COMPANION")
-    st.divider()
-
-    st.markdown("**WORKSPACE**")
-
-    # The radio selection determines which feature appears in the main area.
-    features = {
-        "Understand Paper": "🧠",
-        "Paper Summary": "📝",
-        "Ask the Paper": "💬",
-        "Word Explorer": "🔎",
-        "Deep Dive": "🧪",
-    }
-
-    st.radio(
-        "WORKSPACE",
-        options=list(features.keys()),
-        format_func=lambda feature: f"{features[feature]}  {feature}",
-        key="active_feature",
-        label_visibility="collapsed",
+# ==============================================================================
+# SECTION 5: Main Application Entry Point
+# ==============================================================================
+def main():
+    # --------------------------------------------------------------------------
+    # 5.1 Page Configuration & Responsive Design
+    # --------------------------------------------------------------------------
+    st.set_page_config(
+        page_title="PaperLens — AI Research Assistant",
+        page_icon="📄",
+        layout="wide",
+        initial_sidebar_state="expanded",
     )
 
-    st.divider()
-    st.markdown("**CURRENT PAPER**")
+    # Custom styling for hero section, cards, and citation boxes
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            padding-top: 1.8rem;
+            padding-bottom: 3rem;
+            max-width: 1250px;
+        }
+        [data-testid="stSidebar"] {
+            border-right: 1px solid rgba(128, 128, 128, 0.15);
+        }
+        .hero {
+            padding: 1.8rem 2.2rem;
+            border-radius: 16px;
+            background: linear-gradient(135deg, rgba(91, 100, 240, 0.14), rgba(36, 180, 170, 0.09));
+            border: 1px solid rgba(128, 128, 128, 0.18);
+            margin-bottom: 1.5rem;
+        }
+        .hero-badge {
+            display: inline-block;
+            font-size: 0.72rem;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+            font-weight: 700;
+            padding: 3px 10px;
+            border-radius: 20px;
+            background: rgba(91, 100, 240, 0.2);
+            color: #5b64f0;
+            margin-bottom: 0.6rem;
+        }
+        .feature-card {
+            padding: 1.2rem;
+            border: 1px solid rgba(128, 128, 128, 0.2);
+            border-radius: 12px;
+            min-height: 135px;
+            margin-bottom: 0.8rem;
+            background: rgba(128, 128, 128, 0.03);
+        }
+        .citation-box {
+            padding: 0.8rem 1rem;
+            border-left: 3px solid #5b64f0;
+            background: rgba(91, 100, 240, 0.05);
+            border-radius: 0 8px 8px 0;
+            margin-bottom: 0.6rem;
+            font-size: 0.88rem;
+        }
+        .citation-meta {
+            font-size: 0.76rem;
+            font-weight: 600;
+            opacity: 0.8;
+            margin-bottom: 0.3rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    paper = st.session_state.paper_data
+    # --------------------------------------------------------------------------
+    # 5.2 Sidebar Setup (Clean, Secure & Minimalist)
+    # --------------------------------------------------------------------------
+    with st.sidebar:
+        st.markdown("# 📄 PaperLens")
+        st.caption("YOUR AI RESEARCH ASSISTANT")
+        st.divider()
 
-    if paper:
-        st.markdown(f"📄 **{paper['name']}**")
-        st.caption(
-            f"{paper['pages']} pages · "
-            f"{len(paper['chunks'])} text chunks"
+        # Load API key silently from .env (no UI inputs or exposed passwords)
+        api_key = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            st.error("API key not found. Please ensure GROQ_API_KEY is defined in your .env file.")
+            st.stop()
+
+        client = get_groq_client(api_key)
+
+        # Locked to the configured model and optimal temperature
+        selected_model = "openai/gpt-oss-20b"
+        temperature = 0.2
+
+        st.markdown("### 🧭 Workspace Mode")
+
+        features = {
+            "Understand Paper": "🧠",
+            "Paper Summary": "📝",
+            "Ask the Paper": "💬",
+            "Word Explorer": "🔎",
+            "Deep Dive": "🧪",
+        }
+
+        if "active_feature" not in st.session_state:
+            st.session_state.active_feature = "Understand Paper"
+
+        st.radio(
+            "WORKSPACE",
+            options=list(features.keys()),
+            format_func=lambda f: f"{features[f]}  {f}",
+            key="active_feature",
+            label_visibility="collapsed",
         )
 
-        # Removing a paper also clears generated results and widget values.
-        if st.button("Remove current paper", use_container_width=True):
-            st.session_state.paper_data = None
+        st.divider()
+        st.markdown("### 📑 Current Document")
 
-            for state_key in (
-                "understanding_report",
-                "paper_summary",
-                "paper_answers",
-                "word_explanation",
-                "deep_dive_result",
-            ):
-                st.session_state[state_key] = None
+        paper = st.session_state.get("paper_data")
 
-            for widget_key in (
-                "paper_question",
-                "word_to_explore",
-                "deep_dive_topic",
-            ):
-                if widget_key in st.session_state:
-                    del st.session_state[widget_key]
+        if paper:
+            st.markdown(f"**{paper['name']}**")
+            st.caption(f"{paper['pages']} pages · {len(paper['chunks'])} chunks indexed")
 
-            st.rerun()
-    else:
-        st.caption("No paper uploaded yet.")
-
-    st.divider()
-
-    # Uploading a new PDF replaces the current paper after processing succeeds.
-    with st.expander("Upload or replace paper"):
-        new_file = st.file_uploader(
-            "Choose a research paper",
-            type=["pdf"],
-            accept_multiple_files=False,
-            max_upload_size=20,
-            key="paper_uploader",
-        )
-
-        if st.button(
-            "Process PDF",
-            use_container_width=True,
-            disabled=new_file is None,
-        ):
-            try:
-                with st.spinner("Reading your research paper..."):
-                    new_paper = process_pdf(new_file)
-
-                # Do not retain results generated for the previous document.
-                st.session_state.paper_data = new_paper
-
-                for state_key in (
-                    "understanding_report",
-                    "paper_summary",
-                    "paper_answers",
-                    "word_explanation",
-                    "deep_dive_result",
-                ):
-                    st.session_state[state_key] = None
-
-                for widget_key in (
-                    "paper_question",
-                    "word_to_explore",
-                    "deep_dive_topic",
-                ):
-                    if widget_key in st.session_state:
-                        del st.session_state[widget_key]
-
-                st.success("Paper processed successfully.")
+            # Unload document and reset generated state
+            if st.button("🗑️ Unload Document", use_container_width=True):
+                st.session_state.paper_data = None
+                st.session_state.retriever = None
+                for key in ["understanding_report", "paper_summary", "paper_answers", "word_explanation", "deep_dive_result"]:
+                    st.session_state[key] = None
                 st.rerun()
+        else:
+            st.caption("No document loaded.")
 
-            except Exception as error:
-                st.error(f"Could not process this PDF: {error}")
+        st.divider()
 
-# -----------------------------
-# Main workspace
-# -----------------------------
-paper = st.session_state.paper_data
-active = st.session_state.active_feature
+        # File upload accordion
+        with st.expander("📤 Upload / Replace PDF", expanded=(paper is None)):
+            uploaded_pdf = st.file_uploader(
+                "Select research PDF",
+                type=["pdf"],
+                accept_multiple_files=False,
+                key="pdf_uploader",
+            )
 
-# Display the PaperLens hero banner.
-st.markdown(
-    """
-    <div class="hero">
-        <div class="hero-label">READ · UNDERSTAND · REVISE</div>
-        <h1>PaperLens</h1>
-        <p>Your research paper, made easier to understand.</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+            if st.button("⚡ Process PDF", use_container_width=True, disabled=uploaded_pdf is None):
+                try:
+                    with st.spinner("Extracting text and building BM25 index..."):
+                        processed = process_pdf(uploaded_pdf)
+                        st.session_state.paper_data = processed
+                        st.session_state.retriever = BM25Retriever(processed["chunks"])
 
+                        # Reset previous feature answers
+                        for key in ["understanding_report", "paper_summary", "paper_answers", "word_explanation", "deep_dive_result"]:
+                            st.session_state[key] = None
 
-# -----------------------------
-# Empty state: no paper uploaded
-# -----------------------------
-if paper is None:
-    st.subheader("Your research workspace")
-    st.write(
-        "Upload one research paper using the sidebar to get started. "
-        "Your workspace will then be ready for paper-specific analysis."
+                    st.success("Document indexed with BM25 engine!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error processing PDF: {e}")
+
+    # --------------------------------------------------------------------------
+    # 5.3 Main Area Hero Header
+    # --------------------------------------------------------------------------
+    st.markdown(
+        """
+        <div class="hero">
+            <div class="hero-badge">RESEARCH ASSISTANT 2.0</div>
+            <h1 style="margin: 0.2rem 0;">PaperLens</h1>
+            <p style="margin: 0; opacity: 0.85;">Deep understanding, structured synthesis, and grounded retrieval for academic papers.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    col1, col2 = st.columns(2)
+    # --------------------------------------------------------------------------
+    # 5.4 Empty State (Prompt user to upload a paper)
+    # --------------------------------------------------------------------------
+    paper = st.session_state.get("paper_data")
+    retriever: Optional[BM25Retriever] = st.session_state.get("retriever")
 
-    with col1:
-        st.markdown(
-            """
-            <div class="feature-card">
-                <h3>🧠 Understand Paper</h3>
-                <p>Learn the background, prerequisites, and ideas
-                behind the research.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    if paper is None:
+        st.subheader("Welcome to PaperLens")
+        st.write("Upload a research paper in the left sidebar to unlock the 5 study modes:")
 
-        st.markdown(
-            """
-            <div class="feature-card">
-                <h3>💬 Ask the Paper</h3>
-                <p>Ask questions and get answers grounded in
-                the uploaded document.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown(
+                """
+                <div class="feature-card">
+                    <h4>🧠 Understand Paper</h4>
+                    <p>Guided, first-read report breaking down motivation, prerequisites, section-by-section logic, and findings.</p>
+                </div>
+                <div class="feature-card">
+                    <h4>💬 Ask the Paper</h4>
+                    <p>Pose specific questions answered with BM25-ranked passages and page-level source evidence.</p>
+                </div>
+                <div class="feature-card">
+                    <h4>🧪 Deep Dive</h4>
+                    <p>Rigorous breakdown of specific sections, methodology steps, mathematical formulations, or experiments.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with col2:
+            st.markdown(
+                """
+                <div class="feature-card">
+                    <h4>📝 Paper Summary</h4>
+                    <p>Revision-ready synthesis matching the paper's original headings and core technical contributions.</p>
+                </div>
+                <div class="feature-card">
+                    <h4>🔎 Word Explorer</h4>
+                    <p>Deconstruct technical terminology and abbreviations with in-paper context and intuitive analogies.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        st.stop()
 
-        st.markdown(
-            """
-            <div class="feature-card">
-                <h3>🧪 Deep Dive</h3>
-                <p>Explore a particular section, methodology,
-                experiment, or result.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    # --------------------------------------------------------------------------
+    # 5.5 Document Metrics Bar
+    # --------------------------------------------------------------------------
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    with col_m1:
+        st.metric("Total Pages", paper["pages"])
+    with col_m2:
+        st.metric("Pages with Text", paper["pages_with_text"])
+    with col_m3:
+        st.metric("Indexed Chunks", len(paper["chunks"]))
+    with col_m4:
+        st.metric("Engine", selected_model.split("/")[-1])
 
-    with col2:
-        st.markdown(
-            """
-            <div class="feature-card">
-                <h3>📝 Paper Summary</h3>
-                <p>Generate a structured, revision-friendly
-                summary that follows the paper's headings.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        st.markdown(
-            """
-            <div class="feature-card">
-                <h3>🔎 Word Explorer</h3>
-                <p>Understand difficult words and technical
-                terms in context.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    st.info(
-        "Choose a feature from the sidebar at any time. "
-        "Upload your paper there to begin."
-    )
-
-
-# -----------------------------
-# Workspace: paper uploaded
-# -----------------------------
-else:
-    st.caption("YOUR CURRENT PAPER")
-    st.title(paper["title"])
-
-    # Show basic information about the uploaded document.
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.metric("Pages", paper["pages"])
-
-    with col2:
-        st.metric(
-            "Characters extracted",
-            f"{len(paper['text']):,}",
-        )
-
-    with col3:
-        st.metric("Text chunks", len(paper["chunks"]))
-
-    if not paper["text"]:
-        st.warning(
-            "No extractable text was found. This PDF may be scanned. "
-            "OCR support is not included in this version."
-        )
+    if not paper["chunks"]:
+        st.error("No extractable text was found in this PDF. It may be a scanned document requiring OCR.")
+        st.stop()
 
     st.divider()
+    active_mode = st.session_state.active_feature
 
-    # -----------------------------
-    # Feature 1: Understand Paper
-    # -----------------------------
-    if active == "Understand Paper":
-        st.header("Understand Paper")
-        st.write(
-            "Build your understanding before diving into the details."
-        )
+    # --------------------------------------------------------------------------
+    # FEATURE 1: Understand Paper (Two-Pass Guided Reading Report)
+    # --------------------------------------------------------------------------
+    if active_mode == "Understand Paper":
+        st.header("🧠 Understand Paper")
+        st.caption("A structured, pedagogical companion designed for your first complete read.")
+        st.info("Generates a two-pass synthesis: first analyzing discrete paper segments, then streaming an integrated pedagogical guide.")
 
-        st.markdown(
-            """
-            Your guided reading report will cover:
-
-            - Prerequisites explained simply
-            - The paper's actual sections and main ideas
-            - Methodology and experiments, where applicable
-            - Key findings, limitations, and technical details
-            """
-        )
-
-        if not paper["text"]:
-            st.warning(
-                "This PDF contains no extractable text, "
-                "so PaperLens cannot analyse it yet."
-            )
-
-        elif st.button(
-            "Generate understanding report",
-            type="primary",
-            use_container_width=True,
-        ):
+        if st.button("🚀 Generate Guided Reading Report", type="primary", use_container_width=True):
             try:
-                with st.spinner(
-                    "Reading your paper and generating explanations..."
-                ):
-                    report = generate_understanding_report(paper["text"])
+                chunks = paper["chunks"]
+                progress_bar = st.progress(0, text="Analyzing paper sections (Pass 1/2)...")
 
-                st.session_state["understanding_report"] = {
-                    "paper_name": paper["name"],
-                    "content": report,
-                }
+                # Pass 1: Map stage across chunk segments
+                segment_size = max(1, len(chunks) // 4)
+                segments = [chunks[i:i + segment_size] for i in range(0, len(chunks), segment_size)]
+                intermediate_notes = []
 
-            except Exception as error:
-                st.error("PaperLens could not generate the report.")
+                for idx, seg in enumerate(segments):
+                    seg_text = "\n\n".join(f"[Page {c['page']}] {c['text']}" for c in seg)
+                    progress_bar.progress(
+                        int((idx / len(segments)) * 60),
+                        text=f"Analyzing segment {idx + 1} of {len(segments)}...",
+                    )
+                    notes = ask_groq_text(
+                        client=client,
+                        model=selected_model,
+                        system_prompt="You are PaperLens, an academic tutor. Identify main contributions, methodology, and key concepts without hallucinating.",
+                        user_prompt=f"Analyze this paper segment:\n\n{seg_text}",
+                        temperature=temperature,
+                        max_tokens=1500,
+                    )
+                    intermediate_notes.append(notes)
 
-                with st.expander("Technical details"):
-                    st.code(str(error))
-        
-        # Display the saved report only for the current paper.
+                # Pass 2: Reduce stage with live token streaming
+                progress_bar.progress(70, text="Synthesizing final reading report (Pass 2/2)...")
+
+                combined_notes = "\n\n--- NEXT SEGMENT ---\n\n".join(intermediate_notes)
+                final_prompt = f"""Create an accurate, structured guided reading report from these research notes:
+
+1. Prerequisites & Background Needed
+2. Core Motivation & Problem Statement
+3. Section-by-Section Logical Flow
+4. Methodology & Architectural Overview
+5. Key Experimental Results & Benchmarks
+6. Known Limitations & Future Directions
+
+RESEARCH NOTES:
+{combined_notes}"""
+
+                st.markdown("### 📖 Guided Reading Report")
+                stream_gen = ask_groq_stream(
+                    client=client,
+                    model=selected_model,
+                    system_prompt="You are PaperLens. Produce a structured, highly educational, technically precise reading guide.",
+                    user_prompt=final_prompt,
+                    temperature=temperature,
+                    max_tokens=4000,
+                )
+                report_text = st.write_stream(stream_gen)
+                progress_bar.progress(100, text="Complete!")
+                st.session_state["understanding_report"] = report_text
+
+            except Exception as e:
+                st.error(f"Generation error: {e}")
+
+        # Download button for generated report
         saved_report = st.session_state.get("understanding_report")
-
-        if (
-            saved_report
-            and saved_report.get("paper_name") == paper["name"]
-        ):
-            st.divider()
-            st.subheader("Your guided reading report")
-            st.markdown(saved_report["content"])
-
+        if saved_report:
             st.download_button(
-                "Download understanding report",
-                data=saved_report["content"],
-                file_name="paperlens_understanding_report.md",
+                "💾 Download Report as Markdown",
+                data=saved_report,
+                file_name=f"{paper['name']}_understanding_report.md",
                 mime="text/markdown",
             )
 
+    # --------------------------------------------------------------------------
+    # FEATURE 2: Paper Summary (Revision Notes)
+    # --------------------------------------------------------------------------
+    elif active_mode == "Paper Summary":
+        st.header("📝 Paper Summary")
+        st.caption("A concise, revision-ready summary strictly preserving the paper's original headings and contributions.")
 
-    # -----------------------------
-    # Feature 2: Paper Summary
-    # -----------------------------
-    elif active == "Paper Summary":
-        st.header("Paper Summary")
-        st.write(
-            "Create a structured summary designed for quick revision."
-        )
-
-        st.markdown(
-            """
-            The summary follows the paper's identifiable headings,
-            explains the main ideas, and retains important technical details.
-            """
-        )
-
-        if not paper["text"]:
-            st.warning(
-                "No extractable text was found, so a summary "
-                "cannot be generated."
-            )
-
-        elif st.button(
-            "Generate paper summary",
-            type="primary",
-            use_container_width=True,
-        ):
+        if st.button("🚀 Generate Revision Summary", type="primary", use_container_width=True):
             try:
-                with st.spinner("Generating your revision summary..."):
-                    summary = generate_paper_summary(paper["text"])
+                chunks = paper["chunks"]
+                progress_bar = st.progress(0, text="Extracting key arguments...")
 
-                st.session_state["paper_summary"] = {
-                    "paper_name": paper["name"],
-                    "content": summary,
-                }
+                segment_size = max(1, len(chunks) // 3)
+                segments = [chunks[i:i + segment_size] for i in range(0, len(chunks), segment_size)]
+                intermediate_notes = []
 
-            except Exception as error:
-                st.error("PaperLens could not generate the summary.")
+                for idx, seg in enumerate(segments):
+                    seg_text = "\n\n".join(f"[Page {c['page']}] {c['text']}" for c in seg)
+                    progress_bar.progress(int((idx / len(segments)) * 60))
+                    notes = ask_groq_text(
+                        client=client,
+                        model=selected_model,
+                        system_prompt="Summarize this section accurately for quick revision. Capture technical details, methods, and findings.",
+                        user_prompt=f"Section text:\n\n{seg_text}",
+                        temperature=temperature,
+                        max_tokens=1200,
+                    )
+                    intermediate_notes.append(notes)
 
-                with st.expander("Technical details"):
-                    st.code(str(error))
+                progress_bar.progress(70, text="Generating final summary...")
 
-        # Display the summary for the current paper only.
+                final_prompt = f"""Synthesize a revision summary from these section notes:
+- Respect the paper's original headings and logical order.
+- Highlight specific metrics, benchmarks, and claims.
+- Conclude with stated limitations.
+
+NOTES:
+{"\n\n".join(intermediate_notes)}"""
+
+                st.markdown("### 📋 Executive Revision Summary")
+                stream_gen = ask_groq_stream(
+                    client=client,
+                    model=selected_model,
+                    system_prompt="You are PaperLens. Deliver a polished, bulleted revision summary.",
+                    user_prompt=final_prompt,
+                    temperature=temperature,
+                    max_tokens=3500,
+                )
+                summary_text = st.write_stream(stream_gen)
+                progress_bar.progress(100, text="Complete!")
+                st.session_state["paper_summary"] = summary_text
+
+            except Exception as e:
+                st.error(f"Generation error: {e}")
+
         saved_summary = st.session_state.get("paper_summary")
-
-        if (
-            saved_summary
-            and saved_summary.get("paper_name") == paper["name"]
-        ):
-            st.divider()
-            st.subheader("Your revision summary")
-            st.markdown(saved_summary["content"])
-
+        if saved_summary:
             st.download_button(
-                "Download paper summary",
-                data=saved_summary["content"],
-                file_name="paperlens_summary.md",
+                "💾 Download Summary as Markdown",
+                data=saved_summary,
+                file_name=f"{paper['name']}_summary.md",
                 mime="text/markdown",
             )
 
-    # -----------------------------
-    # Feature 3: Ask the Paper
-    # -----------------------------
-    elif active == "Ask the Paper":
-        st.header("Ask the Paper")
-        st.write(
-            "Ask questions about the uploaded research paper."
-        )
+    # --------------------------------------------------------------------------
+    # FEATURE 3: Ask the Paper (BM25 Q&A with Citations)
+    # --------------------------------------------------------------------------
+    elif active_mode == "Ask the Paper":
+        st.header("💬 Ask the Paper")
+        st.caption("Ask questions grounded strictly in the text, powered by BM25 retrieval.")
 
-        question = st.text_area(
-            "Your question",
-            placeholder="What problem is this paper trying to solve?",
-            key="paper_question",
-        ).strip()
+        col_q, col_ex = st.columns([3, 1])
+        with col_ex:
+            st.markdown("**Suggested Questions:**")
+            if st.button("Core Contribution?", use_container_width=True):
+                st.session_state.paper_question = "What is the primary contribution or proposed method of this paper?"
+            if st.button("Datasets Used?", use_container_width=True):
+                st.session_state.paper_question = "What datasets, benchmarks, or experimental setup were used to evaluate the method?"
+            if st.button("Key Limitations?", use_container_width=True):
+                st.session_state.paper_question = "What are the primary limitations or failure modes acknowledged by the authors?"
 
-        if not paper["text"]:
-            st.warning(
-                "No extractable text is available for question answering."
+        with col_q:
+            question = st.text_area(
+                "Enter your question:",
+                value=st.session_state.get("paper_question", ""),
+                placeholder="e.g., How does the attention mechanism in Section 3 differ from prior work?",
+                height=110,
             )
 
-        elif st.button(
-            "Ask question",
-            type="primary",
-            disabled=not question,
-        ):
+        if st.button("🔍 Search & Answer", type="primary", disabled=not question.strip()):
             try:
-                with st.spinner("Finding the answer in your paper..."):
-                    relevant_chunks = get_relevant_chunks(
-                        paper,
-                        question,
-                        limit=4,
-                    )
+                with st.spinner("Executing BM25 retrieval across document chunks..."):
+                    retrieved = retriever.retrieve(question, top_k=5)
 
-                    if not relevant_chunks:
-                        raise ValueError(
-                            "No readable text chunks are available."
-                        )
+                # Show interactive citations drawer
+                display_retrieval_citations(retrieved)
 
-                    context = "\n\n".join(relevant_chunks)
+                context_str = "\n\n".join(f"[Page {c['page']}] {c['text']}" for c, _ in retrieved)
+                prompt = f"""Question: {question}
 
-                    answer = ask_groq(
-                        (
-                            "You are PaperLens, a research paper assistant. "
-                            "Answer using the supplied paper excerpts. "
-                            "Explain concepts clearly and do not invent facts. "
-                            "If the excerpts do not contain enough information, "
-                            "state that limitation explicitly."
-                        ),
-                        f"""Question:
-{question}
+Context Excerpts from Paper:
+{context_str}
 
-Relevant paper excerpts:
-{context}
+Instructions:
+Answer the question thoroughly using ONLY the supplied excerpts.
+Cite relevant page numbers (e.g. '[Page X]') when referencing specific details.
+If the excerpts do not contain enough information, clearly state what is missing."""
 
-Answer the question clearly. Distinguish paper-supported facts
-from any general explanation that may help the reader.""",
-                        max_tokens=1800,
-                    )
+                st.markdown("### 💡 Answer")
+                stream_gen = ask_groq_stream(
+                    client=client,
+                    model=selected_model,
+                    system_prompt="You are PaperLens. Answer questions accurately based on supplied excerpts with explicit page citations.",
+                    user_prompt=prompt,
+                    temperature=temperature,
+                    max_tokens=2000,
+                )
+                answer_text = st.write_stream(stream_gen)
+                st.session_state["paper_answers"] = {"q": question, "a": answer_text, "sources": retrieved}
 
-                st.session_state["paper_answers"] = {
-                    "paper_name": paper["name"],
-                    "question": question,
-                    "answer": answer,
-                }
+            except Exception as e:
+                st.error(f"Error answering question: {e}")
 
-            except Exception as error:
-                st.error("PaperLens could not answer the question.")
+        elif st.session_state.get("paper_answers"):
+            last_qa = st.session_state["paper_answers"]
+            if last_qa.get("sources"):
+                display_retrieval_citations(last_qa["sources"])
 
-                with st.expander("Technical details"):
-                    st.code(str(error))
+    # --------------------------------------------------------------------------
+    # FEATURE 4: Word Explorer (In-Context Technical Definitions)
+    # --------------------------------------------------------------------------
+    elif active_mode == "Word Explorer":
+        st.header("🔎 Word Explorer")
+        st.caption("Explain unfamiliar technical terminology, equations, or abbreviations in context.")
 
-        # Show the latest answer for this document.
-        saved_answer = st.session_state.get("paper_answers")
+        term = st.text_input("Technical Term or Acronym:", placeholder="e.g., Latent Space, Perplexity, LoRA, Ablation").strip()
 
-        if (
-            saved_answer
-            and saved_answer.get("paper_name") == paper["name"]
-        ):
-            st.markdown("### Answer")
-            st.markdown(saved_answer["answer"])
-
-        st.caption(
-            "Answers use selected excerpts from the paper. "
-            "Always check the original text for critical details."
-        )
-
-    # -----------------------------
-    # Feature 4: Word Explorer
-    # -----------------------------
-    elif active == "Word Explorer":
-        st.header("Word Explorer")
-        st.write(
-            "Understand unfamiliar words, abbreviations, and technical terms."
-        )
-
-        term = st.text_input(
-            "Word or technical term",
-            placeholder="e.g., transformer, attention mechanism, ablation",
-            key="word_to_explore",
-        ).strip()
-
-        if not paper["text"]:
-            st.warning(
-                "No extractable text is available for Word Explorer."
-            )
-
-        elif st.button(
-            "Explain term",
-            type="primary",
-            disabled=not term,
-        ):
+        if st.button("📖 Deconstruct Term", type="primary", disabled=not term):
             try:
-                with st.spinner("Explaining the term in context..."):
-                    relevant_chunks = get_relevant_chunks(
-                        paper,
-                        term,
-                        limit=4,
-                    )
+                with st.spinner(f"Locating occurrences of '{term}'..."):
+                    retrieved = retriever.retrieve(term, top_k=4)
 
-                    context = "\n\n".join(relevant_chunks)
+                display_retrieval_citations(retrieved)
 
-                    explanation = ask_groq(
-                        (
-                            "You are PaperLens Word Explorer. Explain "
-                            "technical terms clearly and accurately. "
-                            "Distinguish general definitions from claims "
-                            "supported by the supplied paper excerpts. "
-                            "Never invent paper-specific information."
-                        ),
-                        f"""Explain this term for a reader studying a research paper.
+                context_str = "\n\n".join(f"[Page {c['page']}] {c['text']}" for c, _ in retrieved)
+                prompt = f"""Term: {term}
 
-TERM:
-{term}
+Paper Passages referencing or relating to the term:
+{context_str}
 
-PAPER EXCERPTS:
-{context}
+Please explain this term using the following structure:
+1. 💡 Simple Definition (Plain English, for a newcomer)
+2. 📄 Specific Meaning in this Paper (How the authors use it)
+3. 🧩 Intuitive Analogy
+4. ⚙️ Why It Matters for this Research"""
 
-Organize your answer using these headings:
-1. Simple Meaning
-2. Meaning in This Paper
-3. Example or Analogy
-4. Why It Matters
+                st.markdown(f"### 📚 Explanation: `{term}`")
+                stream_gen = ask_groq_stream(
+                    client=client,
+                    model=selected_model,
+                    system_prompt="You are PaperLens Word Explorer. Explain technical vocabulary clearly without losing scientific precision.",
+                    user_prompt=prompt,
+                    temperature=temperature,
+                    max_tokens=1800,
+                )
+                st.write_stream(stream_gen)
 
-If the excerpts do not mention the term directly, say so and provide
-a general explanation only where appropriate. Do not pretend that
-the paper supports an explanation that is not present in the excerpts.""",
-                        max_tokens=1400,
-                    )
+            except Exception as e:
+                st.error(f"Error explaining term: {e}")
 
-                st.session_state["word_explanation"] = {
-                    "paper_name": paper["name"],
-                    "term": term,
-                    "answer": explanation,
-                }
+    # --------------------------------------------------------------------------
+    # FEATURE 5: Deep Dive (Granular Investigation)
+    # --------------------------------------------------------------------------
+    elif active_mode == "Deep Dive":
+        st.header("🧪 Deep Dive")
+        st.caption("Perform an exhaustive investigation of a specific subsection, algorithm, or theorem.")
 
-            except Exception as error:
-                st.error("PaperLens could not explain this term.")
+        topic = st.text_input("Section, Method, or Experiment to Investigate:", placeholder="e.g., Section 4.2 Training Dynamics, Algorithm 1, Benchmark Ablations").strip()
 
-                with st.expander("Technical details"):
-                    st.code(str(error))
-
-        saved_word = st.session_state.get("word_explanation")
-
-        if (
-            saved_word
-            and saved_word.get("paper_name") == paper["name"]
-        ):
-            st.divider()
-            st.subheader(f"Explanation: {saved_word['term']}")
-            st.markdown(saved_word["answer"])
-
-    # -----------------------------
-    # Feature 5: Deep Dive
-    # -----------------------------
-    elif active == "Deep Dive":
-        st.header("Deep Dive")
-        st.write(
-            "Investigate a specific section, methodology, "
-            "equation, or experiment."
-        )
-
-        topic = st.text_input(
-            "Section or topic to explore",
-            placeholder="e.g., Proposed Method, Experimental Setup",
-            key="deep_dive_topic",
-        ).strip()
-
-        if not paper["text"]:
-            st.warning(
-                "No extractable text is available for Deep Dive."
-            )
-
-        elif st.button(
-            "Explore section",
-            type="primary",
-            disabled=not topic,
-        ):
+        if st.button("🔬 Perform Deep Dive", type="primary", disabled=not topic):
             try:
-                with st.spinner("Analysing the relevant paper excerpts..."):
-                    relevant_chunks = get_relevant_chunks(
-                        paper,
-                        topic,
-                        limit=5,
-                    )
+                with st.spinner(f"Retrieving passages for '{topic}'..."):
+                    retrieved = retriever.retrieve(topic, top_k=6)
 
-                    context = "\n\n".join(relevant_chunks)
+                display_retrieval_citations(retrieved)
 
-                    analysis = ask_groq(
-                        (
-                            "You are PaperLens Deep Dive, a research-paper "
-                            "analysis assistant. Stay grounded in the "
-                            "provided excerpts. Never invent experimental "
-                            "steps, equations, results, or claims."
-                        ),
-                        f"""Explain this research-paper topic in depth.
+                context_str = "\n\n".join(f"[Page {c['page']}] {c['text']}" for c, _ in retrieved)
+                prompt = f"""Target Topic: {topic}
 
-TOPIC:
-{topic}
+Retrieved Paper Passages:
+{context_str}
 
-PAPER EXCERPTS:
-{context}
+Provide an exhaustive, in-depth breakdown:
+1. Architectural / Conceptual Rationale
+2. Step-by-Step Mathematical Formulation or Workflow
+3. Critical Assumptions & Dependencies
+4. Empirical Validation & Notable Findings
+5. Shortcomings or Missing Details
 
-Use the following structure where relevant and supported:
-1. Overview and Purpose
-2. Core Idea
-3. How It Works
-4. Step-by-Step Method or Experiment
-5. Important Technical Concepts
-6. Results and Significance
-7. Limitations or Missing Information
+Do not fabricate details not present in the excerpts. Cite page numbers whenever referencing specific claims."""
 
-Explain difficult concepts clearly while preserving technical accuracy.
-For an experiment, explain its procedure step by step only when
-the excerpts provide enough detail. If a requested topic is not
-covered by the excerpts, clearly state that limitation.""",
-                        max_tokens=2400,
-                    )
+                st.markdown(f"### 🔬 Deep Dive: `{topic}`")
+                stream_gen = ask_groq_stream(
+                    client=client,
+                    model=selected_model,
+                    system_prompt="You are PaperLens Deep Dive. Provide a rigorous, academic analysis grounded in the provided text.",
+                    user_prompt=prompt,
+                    temperature=temperature,
+                    max_tokens=3000,
+                )
+                st.write_stream(stream_gen)
 
-                st.session_state["deep_dive_result"] = {
-                    "paper_name": paper["name"],
-                    "topic": topic,
-                    "answer": analysis,
-                }
+            except Exception as e:
+                st.error(f"Error performing deep dive: {e}")
 
-            except Exception as error:
-                st.error("PaperLens could not analyse this topic.")
+    # --------------------------------------------------------------------------
+    # 5.6 Diagnostics Drawer & Text Preview
+    # --------------------------------------------------------------------------
+    with st.expander("🛠️ Document Diagnostics & Full Text Viewer", expanded=False):
+        st.markdown(f"**Filename:** `{paper['name']}`")
+        st.markdown(f"**Extracted Title:** {paper['title']}")
+        st.markdown(f"**Total Pages:** {paper['pages']} | **Readable Pages:** {paper['pages_with_text']}")
+        st.markdown(f"**BM25 Indexed Chunks:** {len(paper['chunks'])}")
 
-                with st.expander("Technical details"):
-                    st.code(str(error))
-
-        saved_dive = st.session_state.get("deep_dive_result")
-
-        if (
-            saved_dive
-            and saved_dive.get("paper_name") == paper["name"]
-        ):
-            st.divider()
-            st.subheader(f"Deep Dive: {saved_dive['topic']}")
-            st.markdown(saved_dive["answer"])
-
-            st.download_button(
-                "Download Deep Dive",
-                data=saved_dive["answer"],
-                file_name="paperlens_deep_dive.md",
-                mime="text/markdown",
-            )
-
-
-# -----------------------------
-# Optional document diagnostics
-# -----------------------------
-# Keep this section OUTSIDE the feature conditions.
-# It must also remain separate from the feature_descriptions dictionary.
-
-with st.expander("Document diagnostics"):
-    current_paper = st.session_state.paper_data
-
-    if current_paper is None:
-        st.info(
-            "Upload and process a research paper to view diagnostics."
+        st.text_area("Extracted Text Preview", value=paper["text"][:3000], height=220, disabled=True)
+        st.download_button(
+            "📥 Download Full Extracted Text (.txt)",
+            data=paper["text"],
+            file_name=f"{paper['name']}_extracted.txt",
+            mime="text/plain",
         )
 
-    else:
-        st.write(f"**File:** {current_paper['name']}")
-        st.write(f"**Pages:** {current_paper['pages']}")
-        st.write(
-            "**Pages containing text:** "
-            f"{current_paper['pages_with_text']}"
-        )
-        st.write(
-            f"**Total text chunks:** {len(current_paper['chunks'])}"
-        )
-        st.write(
-            f"**Extracted characters:** {len(current_paper['text']):,}"
-        )
 
-        if current_paper["text"]:
-            st.text_area(
-                "Extracted text preview",
-                value=current_paper["text"][:5000],
-                height=250,
-                disabled=True,
-                key="diagnostic_preview",
-            )
-
-            st.download_button(
-                "Download extracted text",
-                data=current_paper["text"],
-                file_name="paperlens_extracted_text.txt",
-                mime="text/plain",
-            )
-
-        else:
-            st.warning(
-                "No extractable text was found. "
-                "Scanned PDFs require OCR, which is not included here."
-            )
-
-
-# -----------------------------
-# Feature descriptions
-# -----------------------------
-feature_descriptions = {
-    "Understand Paper": (
-        "Your first-read companion. Learn the prerequisites, "
-        "understand major sections, follow the proposed approach, "
-        "and explore experiments in simple language."
-    ),
-    "Paper Summary": (
-        "Revision-ready notes following the paper's identifiable "
-        "headings, with key contributions, results, limitations, "
-        "and technical takeaways."
-    ),
-    "Ask the Paper": (
-        "Ask questions in natural language and receive answers "
-        "based on selected excerpts from the uploaded paper."
-    ),
-    "Word Explorer": (
-        "Explore unfamiliar words, abbreviations, and technical "
-        "terms with definitions and paper-specific context."
-    ),
-    "Deep Dive": (
-        "Investigate a heading, method, equation, experiment, "
-        "result, or limitation in greater technical depth."
-    ),
-}
+# Run main application
+if __name__ == "__main__":
+    main()
